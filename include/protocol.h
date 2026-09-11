@@ -1,6 +1,7 @@
 #ifndef SCREEN_SHARING_PROTOCOL_H
 #define SCREEN_SHARING_PROTOCOL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define SS_PROTOCOL_MAGIC 0x53534852u

@@ -5,6 +5,7 @@
 #include "protocol.h"
 #include "transport.h"
 #include "wic_jpeg.h"
+#include "win_compat.h"
 
 #include <windows.h>
 #include <objbase.h>
@@ -379,7 +380,7 @@ static void sender_publish_dirty_tiles(sender_tile_queue_t *queue, const ss_fram
 
 static void sender_print_stats(uint64_t total_bytes, uint64_t start_tick, uint64_t last_tick, uint64_t bytes_since_last, uint64_t cells_since_last)
 {
-    uint64_t now = GetTickCount64();
+    uint64_t now = ss_win_get_tick_count64();
     uint64_t elapsed_ms = now - start_tick;
     uint64_t window_ms = now - last_tick;
     double total_seconds = elapsed_ms > 0 ? (double)elapsed_ms / 1000.0 : 0.0;
@@ -413,7 +414,7 @@ static DWORD WINAPI sender_capture_thread(LPVOID parameter)
     ss_frame_t previous_frame = context->initial_frame;
 
     while (*context->stop_requested == 0) {
-        uint64_t cycle_start = GetTickCount64();
+        uint64_t cycle_start = ss_win_get_tick_count64();
         ss_frame_t current_frame;
         uint64_t cycle_elapsed;
 
@@ -437,7 +438,7 @@ static DWORD WINAPI sender_capture_thread(LPVOID parameter)
         ss_frame_release(&previous_frame);
         previous_frame = current_frame;
 
-        cycle_elapsed = GetTickCount64() - cycle_start;
+        cycle_elapsed = ss_win_get_tick_count64() - cycle_start;
         if (cycle_elapsed < context->config.interval_ms) {
             Sleep(context->config.interval_ms - (DWORD)cycle_elapsed); /* never pad delay on top of an already-slow cycle */
         }
@@ -459,7 +460,7 @@ typedef struct sender_network_context {
 static DWORD WINAPI sender_network_thread(LPVOID parameter)
 {
     sender_network_context_t *context = (sender_network_context_t *)parameter;
-    uint64_t start_tick = GetTickCount64();
+    uint64_t start_tick = ss_win_get_tick_count64();
     uint64_t last_stat_tick = start_tick;
     uint64_t bytes_since_last_stat = 0;
     uint64_t cells_since_last_stat = 0;
@@ -519,7 +520,7 @@ static DWORD WINAPI sender_network_thread(LPVOID parameter)
             }
         }
 
-        now = GetTickCount64();
+        now = ss_win_get_tick_count64();
         bytes_since_last_stat += context->total_bytes_sent - bytes_before;
         if (now - last_stat_tick >= 1000u) {
             sender_print_stats(context->total_bytes_sent, start_tick, last_stat_tick, bytes_since_last_stat, cells_since_last_stat);
@@ -680,7 +681,7 @@ static DWORD WINAPI sender_ber_reader_thread(LPVOID parameter)
             } else {
                 /* no byte-shift fixes it -- likely a bit-level corruption, not a lost/inserted byte; dump a sample for diagnosis, throttled to avoid flooding */
                 static uint64_t last_dump_tick = 0;
-                uint64_t now = GetTickCount64();
+                uint64_t now = ss_win_get_tick_count64();
 
                 if (now - last_dump_tick > 2000) {
                     ss_prbs_state_t dump_state = chunk_start_state;
@@ -819,7 +820,7 @@ int main(int argc, char **argv)
     ZeroMemory(&transport, sizeof(transport));
     ZeroMemory(&initial_frame, sizeof(initial_frame));
 
-    SetProcessDPIAware(); /* otherwise GetSystemMetrics/BitBlt see a DPI-scaled-down desktop, not the real pixel resolution */
+    ss_win_set_process_dpi_aware(); /* otherwise GetSystemMetrics/BitBlt see a DPI-scaled-down desktop, not the real pixel resolution */
 
     {
         int parse_result = sender_parse_args(argc, argv, &config);

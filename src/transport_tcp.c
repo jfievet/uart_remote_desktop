@@ -6,6 +6,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <winerror.h>
 #include <stdlib.h>
 
 static int ss_transport_store_socket(ss_transport_t *transport, SOCKET socket_handle)
@@ -38,18 +39,21 @@ static int ss_transport_connect_socket(const char *host, unsigned short port, SO
 
     *out_socket = INVALID_SOCKET;
 
-    for (struct addrinfo *current = result; current != NULL; current = current->ai_next) {
-        SOCKET socket_handle = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
-        if (socket_handle == INVALID_SOCKET) {
-            continue;
-        }
+    {
+        struct addrinfo *current;
+        for (current = result; current != NULL; current = current->ai_next) {
+            SOCKET socket_handle = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
+            if (socket_handle == INVALID_SOCKET) {
+                continue;
+            }
 
-        if (connect(socket_handle, current->ai_addr, (int)current->ai_addrlen) == 0) {
-            *out_socket = socket_handle;
-            break;
-        }
+            if (connect(socket_handle, current->ai_addr, (int)current->ai_addrlen) == 0) {
+                *out_socket = socket_handle;
+                break;
+            }
 
-        closesocket(socket_handle);
+            closesocket(socket_handle);
+        }
     }
 
     freeaddrinfo(result);

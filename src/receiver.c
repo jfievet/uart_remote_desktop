@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include "transport.h"
 #include "wic_jpeg.h"
+#include "win_compat.h"
 
 #include <windows.h>
 #include <objbase.h>
@@ -164,7 +165,7 @@ static void receiver_run_ber_mode(const receiver_config_t *config)
     }
 
     printf("BER loopback mode: connected, relaying data back to the sender...\n");
-    last_print_tick = GetTickCount64();
+    last_print_tick = ss_win_get_tick_count64();
 
     for (;;) {
         uint64_t now;
@@ -179,7 +180,7 @@ static void receiver_run_ber_mode(const receiver_config_t *config)
 
         window_bytes[window_pos] += sizeof(buffer);
 
-        now = GetTickCount64();
+        now = ss_win_get_tick_count64();
         if (now - last_print_tick >= 1000u) {
             uint64_t window_total = 0;
             int i;
@@ -303,7 +304,7 @@ static void receiver_forward_mouse_event(receiver_context_t *context, HWND windo
     remote_y = (uint32_t)((int64_t)client_y * framebuffer_height / client_height);
 
     if (throttle_move) {
-        uint64_t now = GetTickCount64();
+        uint64_t now = ss_win_get_tick_count64();
         if (now - context->last_mouse_move_tick < SS_MOUSE_MOVE_MIN_INTERVAL_MS) {
             return;
         }
@@ -518,7 +519,7 @@ int main(int argc, char **argv)
 
     ZeroMemory(&context, sizeof(context));
 
-    SetProcessDPIAware(); /* otherwise the window/client rect is DPI-scaled, not real pixels */
+    ss_win_set_process_dpi_aware(); /* otherwise the window/client rect is DPI-scaled, not real pixels */
 
     {
         int parse_result = receiver_parse_args(argc, argv, &config);
