@@ -38,3 +38,6 @@ sender.exe --uart --com 7 --speed 500000 --ber
 sender.exe --help      # full option list (--host, --port, --interval-ms, --tile-size, --tcp/--uart, --com, --speed, --ber)
 receiver.exe --help    # full option list (--tcp/--uart, --port, --com, --speed, --ber)
 ```
+
+## Note
+This project is generated with the help of AI 
