@@ -22,11 +22,12 @@ typedef struct sender_config {
     ss_transport_type_t transport_type;
     unsigned int com_port;
     unsigned long baud_rate;
+    ss_jpeg_backend_t jpeg_backend;
 } sender_config_t;
 
 static void sender_print_usage(void)
 {
-    printf("Usage: sender [--tcp | --uart] --host <ip> --port <port> [--com <n>] [--speed <baud>] [--interval-ms <ms>] [--tile-size <pixels>] [--ber]\n");
+    printf("Usage: sender [--tcp | --uart] --host <ip> --port <port> [--com <n>] [--speed <baud>] [--interval-ms <ms>] [--tile-size <pixels>] [--jpeg-backend windows|c] [--ber]\n");
 }
 
 static DWORD WINAPI sender_input_thread(LPVOID parameter)
@@ -93,6 +94,7 @@ static int sender_parse_args(int argc, char **argv, sender_config_t *config)
     config->transport_type = SS_TRANSPORT_TCP;
     config->com_port = 0;
     config->baud_rate = 3000000UL;
+    config->jpeg_backend = SS_JPEG_BACKEND_WINDOWS;
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--help") == 0 || strcmp(argv[index], "-h") == 0) {
@@ -115,6 +117,10 @@ static int sender_parse_args(int argc, char **argv, sender_config_t *config)
             config->com_port = (unsigned int)atoi(argv[++index]);
         } else if (strcmp(argv[index], "--speed") == 0 && index + 1 < argc) {
             config->baud_rate = (unsigned long)strtod(argv[++index], NULL);
+        } else if (strcmp(argv[index], "--jpeg-backend") == 0 && index + 1 < argc) {
+            if (ss_jpeg_parse_backend(argv[++index], &config->jpeg_backend) != 0) {
+                return -1;
+            }
         } else {
             return -1;
         }
@@ -859,6 +865,8 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+
+    ss_jpeg_set_backend(config.jpeg_backend);
 
     if (config.ber_mode) {
         sender_run_ber_mode(&transport);

@@ -4,6 +4,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef enum ss_jpeg_backend {
+    SS_JPEG_BACKEND_WINDOWS = 0,
+    SS_JPEG_BACKEND_C = 1
+} ss_jpeg_backend_t;
+
+void ss_jpeg_set_backend(ss_jpeg_backend_t backend);
+int ss_jpeg_parse_backend(const char *name, ss_jpeg_backend_t *out_backend);
 int ss_jpeg_encode_bgra(const uint8_t *bgra, uint32_t width, uint32_t height, uint32_t stride, float quality, uint8_t **out_data, size_t *out_size);
 int ss_jpeg_decode_to_bgra(const uint8_t *data, size_t size, uint8_t **out_pixels, uint32_t *out_width, uint32_t *out_height, uint32_t *out_stride);
 void ss_jpeg_shutdown(void);

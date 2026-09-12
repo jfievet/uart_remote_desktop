@@ -28,6 +28,7 @@ typedef struct receiver_config {
     ss_transport_type_t transport_type;
     unsigned int com_port;
     unsigned long baud_rate;
+    ss_jpeg_backend_t jpeg_backend;
 } receiver_config_t;
 
 typedef struct receiver_context {
@@ -86,7 +87,7 @@ static void receiver_framebuffer_patch(receiver_framebuffer_t *framebuffer, uint
 
 static void receiver_print_usage(void)
 {
-    printf("Usage: receiver [--tcp | --uart] [--port <port>] [--com <n>] [--speed <baud>] [--ber]\n");
+    printf("Usage: receiver [--tcp | --uart] [--port <port>] [--com <n>] [--speed <baud>] [--jpeg-backend windows|c] [--ber]\n");
 }
 
 static int receiver_parse_args(int argc, char **argv, receiver_config_t *config)
@@ -98,6 +99,7 @@ static int receiver_parse_args(int argc, char **argv, receiver_config_t *config)
     config->transport_type = SS_TRANSPORT_TCP;
     config->com_port = 0;
     config->baud_rate = 3000000UL;
+    config->jpeg_backend = SS_JPEG_BACKEND_WINDOWS;
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--help") == 0 || strcmp(argv[index], "-h") == 0) {
@@ -114,6 +116,10 @@ static int receiver_parse_args(int argc, char **argv, receiver_config_t *config)
             config->com_port = (unsigned int)atoi(argv[++index]);
         } else if (strcmp(argv[index], "--speed") == 0 && index + 1 < argc) {
             config->baud_rate = (unsigned long)strtod(argv[++index], NULL);
+        } else if (strcmp(argv[index], "--jpeg-backend") == 0 && index + 1 < argc) {
+            if (ss_jpeg_parse_backend(argv[++index], &config->jpeg_backend) != 0) {
+                return -1;
+            }
         } else {
             return -1;
         }
@@ -539,6 +545,8 @@ int main(int argc, char **argv)
         WSACleanup();
         return 0;
     }
+
+    ss_jpeg_set_backend(config.jpeg_backend);
 
     {
         HRESULT com_result = CoInitializeEx(NULL, COINIT_MULTITHREADED);

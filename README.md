@@ -23,21 +23,32 @@ receiver.exe --uart --com 13 --speed 500000
 sender.exe --uart --com 7 --speed 500000
 ```
 
-## BER (link test) mode — no display window, console stats only
+## BER (link test) mode ? no display window, console stats only
 
 ```
 receiver.exe --uart --com 13 --speed 500000 --ber
 sender.exe --uart --com 7 --speed 500000 --ber
 ```
 
-> Start the receiver first in every mode — it waits for the sender to connect/open the port.
+> Start the receiver first in every mode ? it waits for the sender to connect/open the port.
 
 ## Other options
 
 ```
-sender.exe --help      # full option list (--host, --port, --interval-ms, --tile-size, --tcp/--uart, --com, --speed, --ber)
-receiver.exe --help    # full option list (--tcp/--uart, --port, --com, --speed, --ber)
+sender.exe --help      # full option list (--host, --port, --interval-ms, --tile-size, --tcp/--uart, --com, --speed, --jpeg-backend, --ber)
+receiver.exe --help    # full option list (--tcp/--uart, --port, --com, --speed, --jpeg-backend, --ber)
 ```
+
+JPEG compression can use either the default Windows/GDI+ backend or a pure-C stb backend:
+
+```
+sender.exe --jpeg-backend windows
+sender.exe --jpeg-backend c
+receiver.exe --jpeg-backend windows
+receiver.exe --jpeg-backend c
+```
+
+The sender and receiver do not need to use the same JPEG backend because the wire format remains standard JPEG.
 
 ## Note
 This project is generated with the help of AI 
