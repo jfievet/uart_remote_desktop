@@ -32,6 +32,25 @@
 static ss_jpeg_backend_t ss_jpeg_backend = SS_JPEG_BACKEND_WINDOWS;
 static ULONG_PTR ss_gdiplus_token = 0;
 
+/* called at most once even if multiple encode/decode worker threads race to start GDI+ */
+static BOOL CALLBACK ss_jpeg_startup_once(PINIT_ONCE init_once, PVOID parameter, PVOID *context)
+{
+    GdiplusStartupInput input;
+
+    (void)init_once;
+    (void)parameter;
+    (void)context;
+
+    ZeroMemory(&input, sizeof(input));
+    input.GdiplusVersion = 1;
+
+    if (GdiplusStartup(&ss_gdiplus_token, &input, NULL) != Ok) {
+        ss_gdiplus_token = 0;
+    }
+
+    return TRUE;
+}
+
 void ss_jpeg_set_backend(ss_jpeg_backend_t backend)
 {
     if (backend == SS_JPEG_BACKEND_C || backend == SS_JPEG_BACKEND_WINDOWS) {
@@ -60,16 +79,10 @@ int ss_jpeg_parse_backend(const char *name, ss_jpeg_backend_t *out_backend)
 
 static int ss_jpeg_startup(void)
 {
-    GdiplusStartupInput input;
+    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
 
-    if (ss_gdiplus_token != 0) {
-        return 0;
-    }
-
-    ZeroMemory(&input, sizeof(input));
-    input.GdiplusVersion = 1;
-
-    return GdiplusStartup(&ss_gdiplus_token, &input, NULL) == Ok ? 0 : -1;
+    InitOnceExecuteOnce(&init_once, ss_jpeg_startup_once, NULL, NULL);
+    return ss_gdiplus_token != 0 ? 0 : -1;
 }
 
 void ss_jpeg_shutdown(void)
@@ -153,6 +166,34 @@ static int ss_find_jpeg_encoder(CLSID *out_clsid)
     return -1;
 }
 
+static int ss_jpeg_clsid_valid = 0;
+static CLSID ss_jpeg_clsid;
+
+/* called at most once even if multiple encode worker threads race to look up the codec */
+static BOOL CALLBACK ss_jpeg_clsid_lookup_once(PINIT_ONCE init_once, PVOID parameter, PVOID *context)
+{
+    (void)init_once;
+    (void)parameter;
+    (void)context;
+
+    ss_jpeg_clsid_valid = (ss_find_jpeg_encoder(&ss_jpeg_clsid) == 0);
+    return TRUE;
+}
+
+/* GdipGetImageEncoders enumerates every installed codec -- too costly to repeat on every encode call */
+static int ss_jpeg_ensure_clsid(CLSID *out_clsid)
+{
+    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
+
+    InitOnceExecuteOnce(&init_once, ss_jpeg_clsid_lookup_once, NULL, NULL);
+    if (!ss_jpeg_clsid_valid) {
+        return -1;
+    }
+
+    *out_clsid = ss_jpeg_clsid;
+    return 0;
+}
+
 static int ss_jpeg_windows_encode_bgra(const uint8_t *bgra, uint32_t width, uint32_t height, uint32_t stride, float quality, uint8_t **out_data, size_t *out_size)
 {
     GpBitmap *bitmap = NULL;
@@ -169,7 +210,7 @@ static int ss_jpeg_windows_encode_bgra(const uint8_t *bgra, uint32_t width, uint
         return -1;
     }
 
-    if (ss_jpeg_startup() != 0 || ss_find_jpeg_encoder(&jpeg_clsid) != 0) {
+    if (ss_jpeg_startup() != 0 || ss_jpeg_ensure_clsid(&jpeg_clsid) != 0) {
         return -1;
     }
 

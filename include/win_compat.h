@@ -25,6 +25,27 @@ static uint64_t ss_win_get_tick_count64(void)
     return (uint64_t)GetTickCount();
 }
 
+static uint64_t ss_win_get_perf_counter(void)
+{
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (uint64_t)counter.QuadPart;
+}
+
+/* elapsed time in milliseconds between two ss_win_get_perf_counter() samples */
+static double ss_win_perf_counter_to_ms(uint64_t start, uint64_t end)
+{
+    static LARGE_INTEGER frequency;
+    static int looked_up = 0;
+
+    if (!looked_up) {
+        QueryPerformanceFrequency(&frequency);
+        looked_up = 1;
+    }
+
+    return frequency.QuadPart > 0 ? ((double)(end - start) * 1000.0) / (double)frequency.QuadPart : 0.0;
+}
+
 static void ss_win_set_process_dpi_aware(void)
 {
     typedef BOOL (WINAPI *ss_set_process_dpi_aware_fn)(void);

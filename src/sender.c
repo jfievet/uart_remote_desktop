@@ -23,11 +23,69 @@ typedef struct sender_config {
     unsigned int com_port;
     unsigned long baud_rate;
     ss_jpeg_backend_t jpeg_backend;
+    ss_capture_backend_t capture_backend;
+    int debug_enabled;
 } sender_config_t;
 
 static void sender_print_usage(void)
 {
-    printf("Usage: sender [--tcp | --uart] --host <ip> --port <port> [--com <n>] [--speed <baud>] [--interval-ms <ms>] [--tile-size <pixels>] [--jpeg-backend windows|c] [--ber]\n");
+    printf("Usage: sender [--tcp | --uart] --host <ip> --port <port> [--com <n>] [--speed <baud>] [--interval-ms <ms>] [--tile-size <pixels>] [--jpeg-backend windows|c] [--capture-backend gdi|dxgi] [--ber] [--debug]\n");
+}
+
+typedef enum sender_debug_stage {
+    SENDER_DEBUG_STAGE_CAPTURE = 0,
+    SENDER_DEBUG_STAGE_DIFF,
+    SENDER_DEBUG_STAGE_ENCODE,
+    SENDER_DEBUG_STAGE_SEND,
+    SENDER_DEBUG_STAGE_COUNT
+} sender_debug_stage_t;
+
+typedef struct sender_debug_stats {
+    CRITICAL_SECTION lock;
+    double stage_total_ms[SENDER_DEBUG_STAGE_COUNT];
+    uint64_t stage_count[SENDER_DEBUG_STAGE_COUNT];
+} sender_debug_stats_t;
+
+static const char *sender_debug_stage_names[SENDER_DEBUG_STAGE_COUNT] = { "capture", "diff", "encode", "send" };
+
+static void sender_debug_stats_init(sender_debug_stats_t *stats)
+{
+    ZeroMemory(stats, sizeof(*stats));
+    InitializeCriticalSection(&stats->lock);
+}
+
+static void sender_debug_stats_destroy(sender_debug_stats_t *stats)
+{
+    DeleteCriticalSection(&stats->lock);
+}
+
+static void sender_debug_stats_add(sender_debug_stats_t *stats, sender_debug_stage_t stage, double elapsed_ms)
+{
+    if (stats == NULL) {
+        return;
+    }
+
+    EnterCriticalSection(&stats->lock);
+    stats->stage_total_ms[stage] += elapsed_ms;
+    stats->stage_count[stage] += 1;
+    LeaveCriticalSection(&stats->lock);
+}
+
+static void sender_print_debug_stats(sender_debug_stats_t *stats)
+{
+    int stage;
+
+    EnterCriticalSection(&stats->lock);
+    printf("Debug stage timings (avg ms/call)");
+    for (stage = 0; stage < SENDER_DEBUG_STAGE_COUNT; ++stage) {
+        double average_ms = stats->stage_count[stage] > 0 ? stats->stage_total_ms[stage] / (double)stats->stage_count[stage] : 0.0;
+        printf(" | %s : %.3f ms (%llu calls)", sender_debug_stage_names[stage], average_ms, (unsigned long long)stats->stage_count[stage]);
+        stats->stage_total_ms[stage] = 0.0;
+        stats->stage_count[stage] = 0;
+    }
+    printf("\n");
+    fflush(stdout);
+    LeaveCriticalSection(&stats->lock);
 }
 
 static DWORD WINAPI sender_input_thread(LPVOID parameter)
@@ -95,6 +153,7 @@ static int sender_parse_args(int argc, char **argv, sender_config_t *config)
     config->com_port = 0;
     config->baud_rate = 3000000UL;
     config->jpeg_backend = SS_JPEG_BACKEND_WINDOWS;
+    config->capture_backend = SS_CAPTURE_BACKEND_GDI;
 
     for (index = 1; index < argc; ++index) {
         if (strcmp(argv[index], "--help") == 0 || strcmp(argv[index], "-h") == 0) {
@@ -121,6 +180,12 @@ static int sender_parse_args(int argc, char **argv, sender_config_t *config)
             if (ss_jpeg_parse_backend(argv[++index], &config->jpeg_backend) != 0) {
                 return -1;
             }
+        } else if (strcmp(argv[index], "--capture-backend") == 0 && index + 1 < argc) {
+            if (ss_capture_parse_backend(argv[++index], &config->capture_backend) != 0) {
+                return -1;
+            }
+        } else if (strcmp(argv[index], "--debug") == 0) {
+            config->debug_enabled = 1;
         } else {
             return -1;
         }
@@ -141,25 +206,23 @@ static int sender_parse_args(int argc, char **argv, sender_config_t *config)
     return 0;
 }
 
-static int sender_send_message(ss_transport_t *transport, ss_message_type_t type, uint32_t x, uint32_t y, uint32_t width, uint32_t height, const uint8_t *pixels, uint32_t stride, uint64_t *bytes_sent)
+static uint8_t *sender_build_message_buffer(ss_message_type_t type, uint32_t x, uint32_t y, uint32_t width, uint32_t height, const uint8_t *jpeg_data, size_t jpeg_size, size_t *out_message_size)
 {
     ss_message_header_t header;
-    uint8_t *jpeg_data = NULL;
-    size_t jpeg_size = 0;
-
-    if (ss_jpeg_encode_bgra(pixels, width, height, stride, 0.80f, &jpeg_data, &jpeg_size) != 0) {
-        return -1;
-    }
+    uint8_t *buffer;
 
     ss_protocol_make_header(&header, type, x, y, width, height, (uint32_t)jpeg_size);
-    if (ss_transport_send_all(transport, &header, sizeof(header)) != 0 || ss_transport_send_all(transport, jpeg_data, jpeg_size) != 0) {
-        free(jpeg_data);
-        return -1;
+
+    /* one contiguous buffer so the send thread issues a single write instead of a separate header segment */
+    *out_message_size = sizeof(header) + jpeg_size;
+    buffer = (uint8_t *)malloc(*out_message_size);
+    if (buffer == NULL) {
+        return NULL;
     }
 
-    *bytes_sent += sizeof(header) + jpeg_size;
-    free(jpeg_data);
-    return 0;
+    memcpy(buffer, &header, sizeof(header));
+    memcpy(buffer + sizeof(header), jpeg_data, jpeg_size);
+    return buffer;
 }
 
 static int sender_is_tile_dirty(const ss_frame_t *current, const ss_frame_t *previous, uint32_t x, uint32_t y, uint32_t tile_width, uint32_t tile_height)
@@ -177,211 +240,401 @@ static int sender_is_tile_dirty(const ss_frame_t *current, const ss_frame_t *pre
     return 0;
 }
 
-typedef struct sender_tile_slot {
-    uint8_t *pixels;
+/* ---- region job queue: capture thread -> pool of encode worker threads ---- */
+
+typedef struct sender_region_job {
+    struct sender_region_job *next;
+    uint32_t x;
+    uint32_t y;
     uint32_t width;
     uint32_t height;
-} sender_tile_slot_t;
+    uint8_t *pixels; /* tightly packed BGRA (stride == width*4), owned by the job until freed */
+    ss_message_type_t message_type;
+} sender_region_job_t;
 
-typedef struct sender_tile_queue {
+typedef struct sender_region_queue {
     CRITICAL_SECTION lock;
-    HANDLE ready_event;
-    sender_tile_slot_t *tiles;
-    uint32_t columns;
-    uint32_t rows;
-    uint32_t tile_size;
-    sender_tile_slot_t full_frame;
-} sender_tile_queue_t;
+    CONDITION_VARIABLE not_empty;
+    sender_region_job_t *head;
+    sender_region_job_t *tail;
+    int shutdown;
+} sender_region_queue_t;
 
-static int sender_tile_queue_configure(sender_tile_queue_t *queue, uint32_t frame_width, uint32_t frame_height, uint32_t tile_size)
-{
-    uint32_t columns = (frame_width + tile_size - 1u) / tile_size;
-    uint32_t rows = (frame_height + tile_size - 1u) / tile_size;
-    sender_tile_slot_t *tiles = (sender_tile_slot_t *)calloc((size_t)columns * (size_t)rows, sizeof(sender_tile_slot_t));
-
-    if (tiles == NULL) {
-        return -1;
-    }
-
-    EnterCriticalSection(&queue->lock);
-    if (queue->tiles != NULL) {
-        uint32_t index;
-        for (index = 0; index < queue->columns * queue->rows; ++index) {
-            free(queue->tiles[index].pixels);
-        }
-        free(queue->tiles);
-    }
-    free(queue->full_frame.pixels);
-    ZeroMemory(&queue->full_frame, sizeof(queue->full_frame));
-    queue->tiles = tiles;
-    queue->columns = columns;
-    queue->rows = rows;
-    queue->tile_size = tile_size;
-    LeaveCriticalSection(&queue->lock);
-
-    return 0;
-}
-
-static int sender_tile_queue_create(sender_tile_queue_t *queue, uint32_t frame_width, uint32_t frame_height, uint32_t tile_size)
+static void sender_region_queue_init(sender_region_queue_t *queue)
 {
     ZeroMemory(queue, sizeof(*queue));
     InitializeCriticalSection(&queue->lock);
-    queue->ready_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-    if (queue->ready_event == NULL) {
-        DeleteCriticalSection(&queue->lock);
-        return -1;
-    }
-
-    if (sender_tile_queue_configure(queue, frame_width, frame_height, tile_size) != 0) {
-        CloseHandle(queue->ready_event);
-        DeleteCriticalSection(&queue->lock);
-        return -1;
-    }
-
-    return 0;
+    InitializeConditionVariable(&queue->not_empty);
 }
 
-static void sender_tile_queue_destroy(sender_tile_queue_t *queue)
+static void sender_region_job_free(sender_region_job_t *job)
 {
-    uint32_t index;
+    if (job != NULL) {
+        free(job->pixels);
+        free(job);
+    }
+}
+
+static void sender_region_queue_destroy(sender_region_queue_t *queue)
+{
+    sender_region_job_t *job;
 
     EnterCriticalSection(&queue->lock);
-    for (index = 0; index < queue->columns * queue->rows; ++index) {
-        free(queue->tiles[index].pixels);
-    }
-    free(queue->tiles);
-    free(queue->full_frame.pixels);
+    job = queue->head;
+    queue->head = NULL;
+    queue->tail = NULL;
     LeaveCriticalSection(&queue->lock);
 
-    CloseHandle(queue->ready_event);
+    while (job != NULL) {
+        sender_region_job_t *next = job->next;
+        sender_region_job_free(job);
+        job = next;
+    }
+
     DeleteCriticalSection(&queue->lock);
 }
 
-static void sender_tile_queue_publish_tile(sender_tile_queue_t *queue, uint32_t column, uint32_t row, uint32_t width, uint32_t height, const uint8_t *pixels)
+/* full-frame jobs jump the queue so they are encoded/sent ahead of any pending region updates */
+static void sender_region_queue_push(sender_region_queue_t *queue, sender_region_job_t *job, int priority)
 {
-    size_t size = (size_t)width * (size_t)height * 4u;
-    uint8_t *copy = (uint8_t *)malloc(size);
-
-    if (copy == NULL) {
-        return;
-    }
-    memcpy(copy, pixels, size);
+    job->next = NULL;
 
     EnterCriticalSection(&queue->lock);
-    if (column < queue->columns && row < queue->rows) {
-        /* a still-unsent older snapshot for this cell is now stale -- drop it in favor of this newer one */
-        sender_tile_slot_t *slot = &queue->tiles[(size_t)row * queue->columns + column];
-        free(slot->pixels);
-        slot->pixels = copy;
-        slot->width = width;
-        slot->height = height;
-        copy = NULL;
-    }
-    LeaveCriticalSection(&queue->lock);
-
-    free(copy);
-    SetEvent(queue->ready_event);
-}
-
-static void sender_tile_queue_publish_full_frame(sender_tile_queue_t *queue, const ss_frame_t *frame)
-{
-    size_t size = (size_t)frame->stride * (size_t)frame->height;
-    uint8_t *copy = (uint8_t *)malloc(size);
-
-    if (copy == NULL) {
-        return;
-    }
-    memcpy(copy, frame->pixels, size);
-
-    EnterCriticalSection(&queue->lock);
-    free(queue->full_frame.pixels);
-    queue->full_frame.pixels = copy;
-    queue->full_frame.width = frame->width;
-    queue->full_frame.height = frame->height;
-    LeaveCriticalSection(&queue->lock);
-
-    SetEvent(queue->ready_event);
-}
-
-static uint8_t *sender_tile_queue_take_full_frame(sender_tile_queue_t *queue, uint32_t *width, uint32_t *height)
-{
-    uint8_t *pixels;
-
-    EnterCriticalSection(&queue->lock);
-    pixels = queue->full_frame.pixels;
-    *width = queue->full_frame.width;
-    *height = queue->full_frame.height;
-    queue->full_frame.pixels = NULL;
-    LeaveCriticalSection(&queue->lock);
-
-    return pixels;
-}
-
-static uint8_t *sender_tile_queue_take_tile(sender_tile_queue_t *queue, uint32_t column, uint32_t row, uint32_t *width, uint32_t *height)
-{
-    uint8_t *pixels = NULL;
-
-    EnterCriticalSection(&queue->lock);
-    if (column < queue->columns && row < queue->rows) {
-        sender_tile_slot_t *slot = &queue->tiles[(size_t)row * queue->columns + column];
-        pixels = slot->pixels;
-        *width = slot->width;
-        *height = slot->height;
-        slot->pixels = NULL;
+    if (priority || queue->head == NULL) {
+        job->next = queue->head;
+        queue->head = job;
+        if (queue->tail == NULL) {
+            queue->tail = job;
+        }
     } else {
-        *width = 0;
-        *height = 0;
+        queue->tail->next = job;
+        queue->tail = job;
+    }
+    LeaveCriticalSection(&queue->lock);
+    WakeConditionVariable(&queue->not_empty);
+}
+
+static void sender_region_queue_signal_shutdown(sender_region_queue_t *queue)
+{
+    EnterCriticalSection(&queue->lock);
+    queue->shutdown = 1;
+    LeaveCriticalSection(&queue->lock);
+    WakeAllConditionVariable(&queue->not_empty);
+}
+
+static int sender_region_queue_is_shutdown(sender_region_queue_t *queue)
+{
+    int result;
+
+    EnterCriticalSection(&queue->lock);
+    result = queue->shutdown;
+    LeaveCriticalSection(&queue->lock);
+    return result;
+}
+
+static sender_region_job_t *sender_region_queue_pop_wait(sender_region_queue_t *queue, DWORD timeout_ms)
+{
+    sender_region_job_t *job = NULL;
+
+    EnterCriticalSection(&queue->lock);
+    if (queue->head == NULL && !queue->shutdown) {
+        SleepConditionVariableCS(&queue->not_empty, &queue->lock, timeout_ms);
+    }
+    if (queue->head != NULL) {
+        job = queue->head;
+        queue->head = job->next;
+        if (queue->head == NULL) {
+            queue->tail = NULL;
+        }
     }
     LeaveCriticalSection(&queue->lock);
 
-    return pixels;
+    return job;
 }
 
-static void sender_publish_dirty_tiles(sender_tile_queue_t *queue, const ss_frame_t *current, const ss_frame_t *previous)
+/* copies frame->pixels and enqueues it as a top-priority full-frame job -- frame itself is left untouched */
+static int sender_publish_full_frame(sender_region_queue_t *queue, const ss_frame_t *frame)
 {
-    uint32_t column;
-    uint32_t row;
-    uint32_t columns;
-    uint32_t rows;
-    uint32_t tile_size;
+    size_t frame_size = (size_t)frame->stride * (size_t)frame->height;
+    uint8_t *pixels_copy = (uint8_t *)malloc(frame_size);
+    sender_region_job_t *job;
 
-    EnterCriticalSection(&queue->lock);
-    columns = queue->columns;
-    rows = queue->rows;
-    tile_size = queue->tile_size;
-    LeaveCriticalSection(&queue->lock);
+    if (pixels_copy == NULL) {
+        return -1;
+    }
+    memcpy(pixels_copy, frame->pixels, frame_size);
+
+    job = (sender_region_job_t *)malloc(sizeof(sender_region_job_t));
+    if (job == NULL) {
+        free(pixels_copy);
+        return -1;
+    }
+
+    job->next = NULL;
+    job->x = 0;
+    job->y = 0;
+    job->width = frame->width;
+    job->height = frame->height;
+    job->pixels = pixels_copy;
+    job->message_type = SS_MESSAGE_FULL_FRAME;
+    sender_region_queue_push(queue, job, 1);
+    return 0;
+}
+
+/* merges adjacent dirty grid cells into larger rectangles (row-wise run, then matching-span column-wise merge)
+   so fewer, larger regions get encoded/sent instead of one JPEG per fixed tile */
+static void sender_scan_and_publish_dirty_regions(sender_region_queue_t *region_queue, const ss_frame_t *current, const ss_frame_t *previous, uint32_t tile_size)
+{
+    uint32_t columns = (current->width + tile_size - 1u) / tile_size;
+    uint32_t rows = (current->height + tile_size - 1u) / tile_size;
+    uint8_t *dirty;
+    uint8_t *consumed;
+    uint32_t row;
+    uint32_t column;
+
+    if (columns == 0 || rows == 0) {
+        return;
+    }
+
+    dirty = (uint8_t *)calloc((size_t)columns * (size_t)rows, sizeof(uint8_t));
+    consumed = (uint8_t *)calloc((size_t)columns * (size_t)rows, sizeof(uint8_t));
+    if (dirty == NULL || consumed == NULL) {
+        free(dirty);
+        free(consumed);
+        return;
+    }
 
     for (row = 0; row < rows; ++row) {
         for (column = 0; column < columns; ++column) {
             uint32_t x = column * tile_size;
             uint32_t y = row * tile_size;
-            uint32_t tile_width = current->width - x;
-            uint32_t tile_height = current->height - y;
-            uint8_t *tile_pixels;
+            uint32_t cell_width = current->width - x;
+            uint32_t cell_height = current->height - y;
 
-            if (tile_width > tile_size) {
-                tile_width = tile_size;
+            if (cell_width > tile_size) {
+                cell_width = tile_size;
             }
-            if (tile_height > tile_size) {
-                tile_height = tile_size;
-            }
-
-            if (!sender_is_tile_dirty(current, previous, x, y, tile_width, tile_height)) {
-                continue;
+            if (cell_height > tile_size) {
+                cell_height = tile_size;
             }
 
-            tile_pixels = (uint8_t *)malloc((size_t)tile_width * (size_t)tile_height * 4u);
-            if (tile_pixels == NULL) {
-                continue;
-            }
-
-            if (ss_frame_copy_region(current, x, y, tile_width, tile_height, tile_pixels, tile_width * 4u) == 0) {
-                sender_tile_queue_publish_tile(queue, column, row, tile_width, tile_height, tile_pixels);
-            }
-
-            free(tile_pixels);
+            dirty[(size_t)row * columns + column] = (uint8_t)sender_is_tile_dirty(current, previous, x, y, cell_width, cell_height);
         }
     }
+
+    for (row = 0; row < rows; ++row) {
+        for (column = 0; column < columns; ++column) {
+            uint32_t run_end;
+            uint32_t row_end;
+            uint32_t rect_x;
+            uint32_t rect_y;
+            uint32_t rect_width;
+            uint32_t rect_height;
+            uint8_t *region_pixels;
+
+            if (!dirty[(size_t)row * columns + column] || consumed[(size_t)row * columns + column]) {
+                continue;
+            }
+
+            run_end = column + 1u;
+            while (run_end < columns && dirty[(size_t)row * columns + run_end] && !consumed[(size_t)row * columns + run_end]) {
+                ++run_end;
+            }
+
+            /* extend the run downward while subsequent rows have the exact same span still unconsumed */
+            row_end = row + 1u;
+            for (;;) {
+                uint32_t check_column;
+                int matches = row_end < rows;
+
+                for (check_column = column; matches && check_column < run_end; ++check_column) {
+                    if (!dirty[(size_t)row_end * columns + check_column] || consumed[(size_t)row_end * columns + check_column]) {
+                        matches = 0;
+                    }
+                }
+
+                if (!matches) {
+                    break;
+                }
+                ++row_end;
+            }
+
+            {
+                uint32_t mark_row;
+                uint32_t mark_column;
+                for (mark_row = row; mark_row < row_end; ++mark_row) {
+                    for (mark_column = column; mark_column < run_end; ++mark_column) {
+                        consumed[(size_t)mark_row * columns + mark_column] = 1;
+                    }
+                }
+            }
+
+            rect_x = column * tile_size;
+            rect_y = row * tile_size;
+            rect_width = current->width - rect_x;
+            rect_height = current->height - rect_y;
+            if (rect_width > (run_end - column) * tile_size) {
+                rect_width = (run_end - column) * tile_size;
+            }
+            if (rect_height > (row_end - row) * tile_size) {
+                rect_height = (row_end - row) * tile_size;
+            }
+
+            region_pixels = (uint8_t *)malloc((size_t)rect_width * (size_t)rect_height * 4u);
+            if (region_pixels == NULL) {
+                continue;
+            }
+
+            if (ss_frame_copy_region(current, rect_x, rect_y, rect_width, rect_height, region_pixels, rect_width * 4u) != 0) {
+                free(region_pixels);
+                continue;
+            }
+
+            {
+                sender_region_job_t *job = (sender_region_job_t *)malloc(sizeof(sender_region_job_t));
+                if (job == NULL) {
+                    free(region_pixels);
+                    continue;
+                }
+                job->next = NULL;
+                job->x = rect_x;
+                job->y = rect_y;
+                job->width = rect_width;
+                job->height = rect_height;
+                job->pixels = region_pixels;
+                job->message_type = SS_MESSAGE_UPDATE_REGION;
+                sender_region_queue_push(region_queue, job, 0);
+            }
+        }
+    }
+
+    free(dirty);
+    free(consumed);
+}
+
+/* ---- send job queue: pool of encode worker threads -> single dedicated send thread ---- */
+
+typedef struct sender_send_job {
+    struct sender_send_job *next;
+    uint8_t *buffer;
+    size_t size;
+} sender_send_job_t;
+
+typedef struct sender_send_queue {
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE not_empty;
+    sender_send_job_t *head;
+    sender_send_job_t *tail;
+    int shutdown;
+} sender_send_queue_t;
+
+static void sender_send_queue_init(sender_send_queue_t *queue)
+{
+    ZeroMemory(queue, sizeof(*queue));
+    InitializeCriticalSection(&queue->lock);
+    InitializeConditionVariable(&queue->not_empty);
+}
+
+static void sender_send_job_free(sender_send_job_t *job)
+{
+    if (job != NULL) {
+        free(job->buffer);
+        free(job);
+    }
+}
+
+static void sender_send_queue_destroy(sender_send_queue_t *queue)
+{
+    sender_send_job_t *job;
+
+    EnterCriticalSection(&queue->lock);
+    job = queue->head;
+    queue->head = NULL;
+    queue->tail = NULL;
+    LeaveCriticalSection(&queue->lock);
+
+    while (job != NULL) {
+        sender_send_job_t *next = job->next;
+        sender_send_job_free(job);
+        job = next;
+    }
+
+    DeleteCriticalSection(&queue->lock);
+}
+
+static void sender_send_queue_push(sender_send_queue_t *queue, sender_send_job_t *job, int priority)
+{
+    job->next = NULL;
+
+    EnterCriticalSection(&queue->lock);
+    if (priority || queue->head == NULL) {
+        job->next = queue->head;
+        queue->head = job;
+        if (queue->tail == NULL) {
+            queue->tail = job;
+        }
+    } else {
+        queue->tail->next = job;
+        queue->tail = job;
+    }
+    LeaveCriticalSection(&queue->lock);
+    WakeConditionVariable(&queue->not_empty);
+}
+
+static void sender_send_queue_signal_shutdown(sender_send_queue_t *queue)
+{
+    EnterCriticalSection(&queue->lock);
+    queue->shutdown = 1;
+    LeaveCriticalSection(&queue->lock);
+    WakeAllConditionVariable(&queue->not_empty);
+}
+
+static int sender_send_queue_is_shutdown(sender_send_queue_t *queue)
+{
+    int result;
+
+    EnterCriticalSection(&queue->lock);
+    result = queue->shutdown;
+    LeaveCriticalSection(&queue->lock);
+    return result;
+}
+
+static sender_send_job_t *sender_send_queue_pop_wait(sender_send_queue_t *queue, DWORD timeout_ms)
+{
+    sender_send_job_t *job = NULL;
+
+    EnterCriticalSection(&queue->lock);
+    if (queue->head == NULL && !queue->shutdown) {
+        SleepConditionVariableCS(&queue->not_empty, &queue->lock, timeout_ms);
+    }
+    if (queue->head != NULL) {
+        job = queue->head;
+        queue->head = job->next;
+        if (queue->head == NULL) {
+            queue->tail = NULL;
+        }
+    }
+    LeaveCriticalSection(&queue->lock);
+
+    return job;
+}
+
+/* non-blocking: used to opportunistically batch whatever else is already queued into one send */
+static sender_send_job_t *sender_send_queue_try_pop(sender_send_queue_t *queue)
+{
+    sender_send_job_t *job = NULL;
+
+    EnterCriticalSection(&queue->lock);
+    if (queue->head != NULL) {
+        job = queue->head;
+        queue->head = job->next;
+        if (queue->head == NULL) {
+            queue->tail = NULL;
+        }
+    }
+    LeaveCriticalSection(&queue->lock);
+
+    return job;
 }
 
 static void sender_print_stats(uint64_t total_bytes, uint64_t start_tick, uint64_t last_tick, uint64_t bytes_since_last, uint64_t cells_since_last)
@@ -409,9 +662,10 @@ static void sender_print_stats(uint64_t total_bytes, uint64_t start_tick, uint64
 
 typedef struct sender_capture_context {
     sender_config_t config;
-    sender_tile_queue_t *queue;
+    sender_region_queue_t *region_queue;
     ss_frame_t initial_frame; /* ownership transferred in from main; becomes the first "previous frame" */
     volatile LONG *stop_requested;
+    sender_debug_stats_t *debug_stats;
 } sender_capture_context_t;
 
 static DWORD WINAPI sender_capture_thread(LPVOID parameter)
@@ -423,22 +677,30 @@ static DWORD WINAPI sender_capture_thread(LPVOID parameter)
         uint64_t cycle_start = ss_win_get_tick_count64();
         ss_frame_t current_frame;
         uint64_t cycle_elapsed;
+        uint64_t stage_start;
 
         ZeroMemory(&current_frame, sizeof(current_frame));
+        stage_start = context->debug_stats != NULL ? ss_win_get_perf_counter() : 0;
         if (ss_capture_primary_screen(&current_frame) != 0) {
             InterlockedExchange(context->stop_requested, 1);
             break;
         }
+        if (context->debug_stats != NULL) {
+            sender_debug_stats_add(context->debug_stats, SENDER_DEBUG_STAGE_CAPTURE, ss_win_perf_counter_to_ms(stage_start, ss_win_get_perf_counter()));
+        }
 
         if (current_frame.width != previous_frame.width || current_frame.height != previous_frame.height) {
-            if (sender_tile_queue_configure(context->queue, current_frame.width, current_frame.height, context->config.tile_size) != 0) {
+            if (sender_publish_full_frame(context->region_queue, &current_frame) != 0) {
                 ss_frame_release(&current_frame);
                 InterlockedExchange(context->stop_requested, 1);
                 break;
             }
-            sender_tile_queue_publish_full_frame(context->queue, &current_frame);
         } else {
-            sender_publish_dirty_tiles(context->queue, &current_frame, &previous_frame);
+            stage_start = context->debug_stats != NULL ? ss_win_get_perf_counter() : 0;
+            sender_scan_and_publish_dirty_regions(context->region_queue, &current_frame, &previous_frame, context->config.tile_size);
+            if (context->debug_stats != NULL) {
+                sender_debug_stats_add(context->debug_stats, SENDER_DEBUG_STAGE_DIFF, ss_win_perf_counter_to_ms(stage_start, ss_win_get_perf_counter()));
+            }
         }
 
         ss_frame_release(&previous_frame);
@@ -452,84 +714,155 @@ static DWORD WINAPI sender_capture_thread(LPVOID parameter)
 
     ss_frame_release(&previous_frame);
     InterlockedExchange(context->stop_requested, 1);
-    SetEvent(context->queue->ready_event); /* wake the network thread so it notices the stop request promptly */
     return 0;
 }
 
-typedef struct sender_network_context {
+typedef struct sender_encode_worker_context {
+    sender_region_queue_t *region_queue;
+    sender_send_queue_t *send_queue;
+    sender_debug_stats_t *debug_stats;
+} sender_encode_worker_context_t;
+
+/* one of a pool of N worker threads (N = CPU core count); a failed encode just drops that region -- only
+   an actual transport send failure (in sender_send_thread) is treated as fatal for the whole session */
+static DWORD WINAPI sender_encode_worker_thread(LPVOID parameter)
+{
+    sender_encode_worker_context_t *context = (sender_encode_worker_context_t *)parameter;
+
+    for (;;) {
+        sender_region_job_t *job = sender_region_queue_pop_wait(context->region_queue, 1000);
+        uint8_t *jpeg_data = NULL;
+        size_t jpeg_size = 0;
+        uint64_t stage_start;
+        int encode_ok;
+
+        if (job == NULL) {
+            if (sender_region_queue_is_shutdown(context->region_queue)) {
+                break;
+            }
+            continue;
+        }
+
+        stage_start = context->debug_stats != NULL ? ss_win_get_perf_counter() : 0;
+        encode_ok = ss_jpeg_encode_bgra(job->pixels, job->width, job->height, job->width * 4u, 0.80f, &jpeg_data, &jpeg_size) == 0;
+        if (context->debug_stats != NULL) {
+            sender_debug_stats_add(context->debug_stats, SENDER_DEBUG_STAGE_ENCODE, ss_win_perf_counter_to_ms(stage_start, ss_win_get_perf_counter()));
+        }
+
+        if (encode_ok) {
+            size_t message_size;
+            uint8_t *message = sender_build_message_buffer(job->message_type, job->x, job->y, job->width, job->height, jpeg_data, jpeg_size, &message_size);
+
+            if (message != NULL) {
+                sender_send_job_t *send_job = (sender_send_job_t *)malloc(sizeof(sender_send_job_t));
+                if (send_job != NULL) {
+                    send_job->next = NULL;
+                    send_job->buffer = message;
+                    send_job->size = message_size;
+                    sender_send_queue_push(context->send_queue, send_job, job->message_type == SS_MESSAGE_FULL_FRAME);
+                } else {
+                    free(message);
+                }
+            }
+        }
+
+        free(jpeg_data);
+        sender_region_job_free(job);
+    }
+
+    return 0;
+}
+
+#define SENDER_SEND_BATCH_MAX_BYTES (256u * 1024u)
+
+typedef struct sender_send_context {
     ss_transport_t *transport;
-    sender_tile_queue_t *queue;
+    sender_send_queue_t *send_queue;
     volatile LONG *stop_requested;
     uint64_t total_bytes_sent;
-} sender_network_context_t;
+    sender_debug_stats_t *debug_stats;
+} sender_send_context_t;
 
-static DWORD WINAPI sender_network_thread(LPVOID parameter)
+static DWORD WINAPI sender_send_thread(LPVOID parameter)
 {
-    sender_network_context_t *context = (sender_network_context_t *)parameter;
+    sender_send_context_t *context = (sender_send_context_t *)parameter;
     uint64_t start_tick = ss_win_get_tick_count64();
     uint64_t last_stat_tick = start_tick;
     uint64_t bytes_since_last_stat = 0;
     uint64_t cells_since_last_stat = 0;
 
-    while (*context->stop_requested == 0) {
-        uint64_t bytes_before = context->total_bytes_sent;
-        uint32_t columns;
-        uint32_t rows;
-        uint32_t tile_size;
-        uint32_t column;
-        uint32_t row;
-        uint32_t full_width;
-        uint32_t full_height;
-        uint8_t *full_frame_pixels;
+    for (;;) {
+        sender_send_job_t *job = sender_send_queue_pop_wait(context->send_queue, 1000);
         uint64_t now;
 
-        WaitForSingleObject(context->queue->ready_event, 50);
-
-        full_frame_pixels = sender_tile_queue_take_full_frame(context->queue, &full_width, &full_height);
-        if (full_frame_pixels != NULL) {
-            int failed = sender_send_message(context->transport, SS_MESSAGE_FULL_FRAME, 0, 0, full_width, full_height, full_frame_pixels, full_width * 4u, &context->total_bytes_sent) != 0;
-            free(full_frame_pixels);
-            if (failed) {
-                InterlockedExchange(context->stop_requested, 1);
+        if (job == NULL) {
+            if (sender_send_queue_is_shutdown(context->send_queue)) {
                 break;
             }
-        }
+        } else {
+            uint8_t *batch_buffer = (uint8_t *)malloc(job->size);
+            size_t batch_size;
+            uint64_t message_count;
+            uint64_t stage_start;
+            int send_failed;
 
-        EnterCriticalSection(&context->queue->lock);
-        columns = context->queue->columns;
-        rows = context->queue->rows;
-        tile_size = context->queue->tile_size;
-        LeaveCriticalSection(&context->queue->lock);
+            if (batch_buffer == NULL) {
+                sender_send_job_free(job);
+                goto check_stats;
+            }
 
-        for (row = 0; row < rows; ++row) {
-            int stop = 0;
-            for (column = 0; column < columns; ++column) {
-                uint32_t tile_width;
-                uint32_t tile_height;
-                uint8_t *tile_pixels = sender_tile_queue_take_tile(context->queue, column, row, &tile_width, &tile_height);
+            memcpy(batch_buffer, job->buffer, job->size);
+            batch_size = job->size;
+            message_count = 1;
+            sender_send_job_free(job);
 
-                if (tile_pixels == NULL) {
-                    continue;
-                }
+            /* opportunistically coalesce whatever else is already queued into one write, bounded so a
+               burst of many ready messages can't grow the batch (and its latency) without limit */
+            while (batch_size < SENDER_SEND_BATCH_MAX_BYTES) {
+                sender_send_job_t *more = sender_send_queue_try_pop(context->send_queue);
+                uint8_t *grown;
 
-                if (sender_send_message(context->transport, SS_MESSAGE_UPDATE_REGION, column * tile_size, row * tile_size, tile_width, tile_height, tile_pixels, tile_width * 4u, &context->total_bytes_sent) != 0) {
-                    free(tile_pixels);
-                    stop = 1;
+                if (more == NULL) {
                     break;
                 }
-                free(tile_pixels);
-                ++cells_since_last_stat;
+
+                grown = (uint8_t *)realloc(batch_buffer, batch_size + more->size);
+                if (grown == NULL) {
+                    sender_send_job_free(more);
+                    break;
+                }
+
+                batch_buffer = grown;
+                memcpy(batch_buffer + batch_size, more->buffer, more->size);
+                batch_size += more->size;
+                ++message_count;
+                sender_send_job_free(more);
             }
-            if (stop) {
+
+            stage_start = context->debug_stats != NULL ? ss_win_get_perf_counter() : 0;
+            send_failed = ss_transport_send_all(context->transport, batch_buffer, batch_size) != 0;
+            if (context->debug_stats != NULL) {
+                sender_debug_stats_add(context->debug_stats, SENDER_DEBUG_STAGE_SEND, ss_win_perf_counter_to_ms(stage_start, ss_win_get_perf_counter()));
+            }
+            free(batch_buffer);
+
+            if (send_failed) {
                 InterlockedExchange(context->stop_requested, 1);
                 break;
             }
+
+            context->total_bytes_sent += batch_size;
+            bytes_since_last_stat += batch_size;
+            cells_since_last_stat += message_count;
         }
 
+check_stats:
         now = ss_win_get_tick_count64();
-        bytes_since_last_stat += context->total_bytes_sent - bytes_before;
         if (now - last_stat_tick >= 1000u) {
             sender_print_stats(context->total_bytes_sent, start_tick, last_stat_tick, bytes_since_last_stat, cells_since_last_stat);
+            if (context->debug_stats != NULL) {
+                sender_print_debug_stats(context->debug_stats);
+            }
             bytes_since_last_stat = 0;
             cells_since_last_stat = 0;
             last_stat_tick = now;
@@ -539,6 +872,7 @@ static DWORD WINAPI sender_network_thread(LPVOID parameter)
     sender_print_stats(context->total_bytes_sent, start_tick, last_stat_tick, bytes_since_last_stat, cells_since_last_stat);
     return 0;
 }
+
 
 #define SS_BER_CHUNK_SIZE 4096u
 #define SS_BER_WINDOW_SECONDS 5u
@@ -813,15 +1147,21 @@ int main(int argc, char **argv)
     WSADATA wsa_data;
     ss_transport_t transport;
     ss_frame_t initial_frame;
-    sender_tile_queue_t queue;
+    sender_region_queue_t region_queue;
+    sender_send_queue_t send_queue;
     sender_capture_context_t capture_context;
-    sender_network_context_t network_context;
+    sender_encode_worker_context_t encode_worker_context;
+    sender_send_context_t send_context;
+    sender_debug_stats_t debug_stats;
     HANDLE input_thread;
     HANDLE capture_thread;
-    HANDLE network_thread;
+    HANDLE send_thread;
+    HANDLE *encode_threads;
+    DWORD encode_thread_count;
     HANDLE wait_handles[2];
     volatile LONG stop_requested = 0;
     int exit_code = 1;
+    DWORD i;
 
     ZeroMemory(&transport, sizeof(transport));
     ZeroMemory(&initial_frame, sizeof(initial_frame));
@@ -867,6 +1207,7 @@ int main(int argc, char **argv)
     }
 
     ss_jpeg_set_backend(config.jpeg_backend);
+    ss_capture_set_backend(config.capture_backend);
 
     if (config.ber_mode) {
         sender_run_ber_mode(&transport);
@@ -884,8 +1225,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (sender_tile_queue_create(&queue, initial_frame.width, initial_frame.height, config.tile_size) != 0) {
-        printf("Unable to allocate the tile queue.\n");
+    {
+        SYSTEM_INFO system_info;
+        GetSystemInfo(&system_info);
+        encode_thread_count = system_info.dwNumberOfProcessors;
+        if (encode_thread_count == 0) {
+            encode_thread_count = 1;
+        }
+    }
+
+    encode_threads = (HANDLE *)calloc(encode_thread_count, sizeof(HANDLE));
+    if (encode_threads == NULL) {
+        printf("Unable to allocate the encode worker thread table.\n");
         ss_frame_release(&initial_frame);
         ss_transport_close(&transport);
         CoUninitialize();
@@ -893,16 +1244,36 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("Detected resolution : %ux%u\n", initial_frame.width, initial_frame.height);
-    printf("Tile grid : %ux%u cells (%u total), tile size %u px\n", queue.columns, queue.rows, queue.columns * queue.rows, config.tile_size);
+    sender_region_queue_init(&region_queue);
+    sender_send_queue_init(&send_queue);
 
-    sender_tile_queue_publish_full_frame(&queue, &initial_frame);
+    {
+        uint32_t columns = (initial_frame.width + config.tile_size - 1u) / config.tile_size;
+        uint32_t rows = (initial_frame.height + config.tile_size - 1u) / config.tile_size;
+        printf("Detected resolution : %ux%u\n", initial_frame.width, initial_frame.height);
+        printf("Tile grid : %ux%u cells (%u total), tile size %u px\n", columns, rows, columns * rows, config.tile_size);
+        printf("Encode workers : %u\n", (unsigned int)encode_thread_count);
+    }
+
+    if (sender_publish_full_frame(&region_queue, &initial_frame) != 0) {
+        printf("Unable to queue the initial frame.\n");
+        free(encode_threads);
+        sender_region_queue_destroy(&region_queue);
+        sender_send_queue_destroy(&send_queue);
+        ss_frame_release(&initial_frame);
+        ss_transport_close(&transport);
+        CoUninitialize();
+        WSACleanup();
+        return 1;
+    }
 
     input_thread = CreateThread(NULL, 0, sender_input_thread, &transport, 0, NULL);
     if (input_thread == NULL) {
         printf("Unable to create input thread.\n");
+        free(encode_threads);
+        sender_region_queue_destroy(&region_queue);
+        sender_send_queue_destroy(&send_queue);
         ss_frame_release(&initial_frame);
-        sender_tile_queue_destroy(&queue);
         ss_transport_close(&transport);
         CoUninitialize();
         WSACleanup();
@@ -910,61 +1281,111 @@ int main(int argc, char **argv)
     }
 
     capture_context.config = config;
-    capture_context.queue = &queue;
+    capture_context.region_queue = &region_queue;
     capture_context.initial_frame = initial_frame; /* ownership moves to the capture thread */
     capture_context.stop_requested = &stop_requested;
+    capture_context.debug_stats = NULL;
 
-    network_context.transport = &transport;
-    network_context.queue = &queue;
-    network_context.stop_requested = &stop_requested;
-    network_context.total_bytes_sent = 0;
+    encode_worker_context.region_queue = &region_queue;
+    encode_worker_context.send_queue = &send_queue;
+    encode_worker_context.debug_stats = NULL;
+
+    send_context.transport = &transport;
+    send_context.send_queue = &send_queue;
+    send_context.stop_requested = &stop_requested;
+    send_context.total_bytes_sent = 0;
+    send_context.debug_stats = NULL;
+
+    if (config.debug_enabled) {
+        sender_debug_stats_init(&debug_stats);
+        capture_context.debug_stats = &debug_stats;
+        encode_worker_context.debug_stats = &debug_stats;
+        send_context.debug_stats = &debug_stats;
+    }
 
     capture_thread = CreateThread(NULL, 0, sender_capture_thread, &capture_context, 0, NULL);
-    network_thread = CreateThread(NULL, 0, sender_network_thread, &network_context, 0, NULL);
+    send_thread = CreateThread(NULL, 0, sender_send_thread, &send_context, 0, NULL);
+    for (i = 0; i < encode_thread_count; ++i) {
+        encode_threads[i] = CreateThread(NULL, 0, sender_encode_worker_thread, &encode_worker_context, 0, NULL);
+    }
 
-    if (capture_thread == NULL || network_thread == NULL) {
-        printf("Unable to create capture/network threads.\n");
-        InterlockedExchange(&stop_requested, 1);
-        SetEvent(queue.ready_event);
-        ss_transport_close(&transport);
+    {
+        int startup_failed = (capture_thread == NULL || send_thread == NULL);
 
-        if (capture_thread != NULL) {
-            WaitForSingleObject(capture_thread, INFINITE);
-            CloseHandle(capture_thread);
-        } else {
-            ss_frame_release(&capture_context.initial_frame);
+        for (i = 0; i < encode_thread_count; ++i) {
+            if (encode_threads[i] == NULL) {
+                startup_failed = 1;
+            }
         }
 
-        if (network_thread != NULL) {
-            WaitForSingleObject(network_thread, INFINITE);
-            CloseHandle(network_thread);
-        }
+        if (startup_failed) {
+            printf("Unable to create capture/encode/send threads.\n");
+            InterlockedExchange(&stop_requested, 1);
+            sender_region_queue_signal_shutdown(&region_queue);
+            sender_send_queue_signal_shutdown(&send_queue);
+            ss_transport_close(&transport);
 
-        WaitForSingleObject(input_thread, INFINITE);
-        CloseHandle(input_thread);
-        sender_tile_queue_destroy(&queue);
-        CoUninitialize();
-        WSACleanup();
-        return 1;
+            if (capture_thread != NULL) {
+                WaitForSingleObject(capture_thread, INFINITE);
+                CloseHandle(capture_thread);
+            } else {
+                ss_frame_release(&capture_context.initial_frame);
+            }
+
+            for (i = 0; i < encode_thread_count; ++i) {
+                if (encode_threads[i] != NULL) {
+                    WaitForSingleObject(encode_threads[i], INFINITE);
+                    CloseHandle(encode_threads[i]);
+                }
+            }
+
+            if (send_thread != NULL) {
+                WaitForSingleObject(send_thread, INFINITE);
+                CloseHandle(send_thread);
+            }
+
+            WaitForSingleObject(input_thread, INFINITE);
+            CloseHandle(input_thread);
+            free(encode_threads);
+            sender_region_queue_destroy(&region_queue);
+            sender_send_queue_destroy(&send_queue);
+            if (config.debug_enabled) {
+                sender_debug_stats_destroy(&debug_stats);
+            }
+            CoUninitialize();
+            WSACleanup();
+            return 1;
+        }
     }
 
     wait_handles[0] = capture_thread;
-    wait_handles[1] = network_thread;
+    wait_handles[1] = send_thread;
     WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
 
     InterlockedExchange(&stop_requested, 1);
-    SetEvent(queue.ready_event);
+    sender_region_queue_signal_shutdown(&region_queue);
+    sender_send_queue_signal_shutdown(&send_queue);
 
     WaitForSingleObject(capture_thread, INFINITE);
-    WaitForSingleObject(network_thread, INFINITE);
     CloseHandle(capture_thread);
-    CloseHandle(network_thread);
+    for (i = 0; i < encode_thread_count; ++i) {
+        WaitForSingleObject(encode_threads[i], INFINITE);
+        CloseHandle(encode_threads[i]);
+    }
+    WaitForSingleObject(send_thread, INFINITE);
+    CloseHandle(send_thread);
 
     ss_transport_close(&transport);
     WaitForSingleObject(input_thread, INFINITE);
     CloseHandle(input_thread);
 
-    sender_tile_queue_destroy(&queue);
+    free(encode_threads);
+    sender_region_queue_destroy(&region_queue);
+    sender_send_queue_destroy(&send_queue);
+    if (config.debug_enabled) {
+        sender_debug_stats_destroy(&debug_stats);
+    }
+    ss_capture_shutdown();
     ss_jpeg_shutdown();
     CoUninitialize();
     WSACleanup();

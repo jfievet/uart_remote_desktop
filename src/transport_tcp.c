@@ -11,6 +11,16 @@
 
 static int ss_transport_store_socket(ss_transport_t *transport, SOCKET socket_handle)
 {
+    int nodelay_enable = 1;
+    int buffer_size = 1 * 1024 * 1024;
+
+    /* disable Nagle -- without it, small header/payload writes can stall waiting for an ACK */
+    setsockopt(socket_handle, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay_enable, sizeof(nodelay_enable));
+
+    /* larger kernel buffers avoid throttling bursts of many encoded messages at high throughput */
+    setsockopt(socket_handle, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size, sizeof(buffer_size));
+    setsockopt(socket_handle, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size, sizeof(buffer_size));
+
     transport->type = SS_TRANSPORT_TCP;
     transport->socket_handle = socket_handle;
     transport->serial_handle = INVALID_HANDLE_VALUE;
